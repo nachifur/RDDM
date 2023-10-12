@@ -45,7 +45,7 @@ The pre-trained models will be provided later.
 
 ## Results
 
-See Table 2 in main paper.
+See Table 3 in main paper.
 
 ## Citation
 If you find our work useful in your research, please consider citing:
