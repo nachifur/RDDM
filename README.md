@@ -5,7 +5,7 @@ This repository is the official implementation of Residual Denoising Diffusion M
 
 Note:
 1. The current setting is to train two unets (one to estimate the residuals and one to estimate the noise), which can be used to explore partially path-independent generation process.
-2. Other tasks can modify the corresponding experimental settings. See Table 4 in the Appendix.
+2. Other tasks need to modify a) `[self.alphas_cumsum[t]*self.num_timesteps, self.betas_cumsum[t]*self.num_timesteps]]` -> `[t,t]` (in [L852](https://github.com/nachifur/RDDM/blob/50d7dc3670a68dfe89c411a9445cc824b4fcd911/src/residual_denoising_diffusion_pytorch.py#L852) and [L1292](https://github.com/nachifur/RDDM/blob/50d7dc3670a68dfe89c411a9445cc824b4fcd911/src/residual_denoising_diffusion_pytorch.py#L1292)). b) modify the corresponding experimental settings (see Table 4 in the Appendix).
 3. The code is being updated.
 
 ## Requirements
