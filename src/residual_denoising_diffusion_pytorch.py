@@ -1489,8 +1489,8 @@ class Trainer(object):
 
         # prepare model, dataloader, optimizer with accelerator
         if self.num_unet == 1:
-            self.model, self.opt = self.accelerator.prepare(
-                self.model, self.opt)
+            self.model, self.opt0 = self.accelerator.prepare(
+                self.model, self.opt0)
         elif self.num_unet == 2:
             self.model, self.opt0, self.opt1 = self.accelerator.prepare(
                 self.model, self.opt0, self.opt1)
