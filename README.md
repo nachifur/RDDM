@@ -47,6 +47,10 @@ The pre-trained models will be provided later.
 
 See Table 3 in main paper.
 
+## Other experiments
+
+We can convert a pre-trained DDIM to RDDM by coefficient transformation (see [code](https://github.com/nachifur/RDDM/tree/main/experiments/convert_pretrained_DDIM_to_RDDM)).
+
 ## Citation
 If you find our work useful in your research, please consider citing:
 ```
