@@ -2,7 +2,7 @@
 
 This repository is the official implementation of Residual Denoising Diffusion Models.
 
-<img width="1000" height="500" src="https://github.com/nachifur/RDDM/blob/main/poster/Jiawei_9969.png"/>
+<img width="800" height="400" src="https://github.com/nachifur/RDDM/blob/main/poster/Jiawei_9969.png"/>
 
 
 
