@@ -2,9 +2,11 @@
 
 This repository is the official implementation of Residual Denoising Diffusion Models.
 
-<img width="800" height="400" src="https://github.com/nachifur/RDDM/blob/main/poster/Jiawei_9969.png"/>
-
-
+<p align="center">
+<a href="https://github.com/nachifur/RDDM" target="_blank">
+<img width="800" height="400" img align="center" alt="RDDM" src="https://github.com/nachifur/RDDM/blob/main/poster/Jiawei_9969.png" />
+</a>
+</p>
 
 Note:
 1. The current setting is to train two unets (one to estimate the residuals and one to estimate the noise), which can be used to explore partially path-independent generation process.
