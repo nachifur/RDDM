@@ -1,5 +1,7 @@
 # Residual Denoising Diffusion Models
 
+[arxiv](https://arxiv.org/abs/2308.13712)|[youtube](https://www.youtube.com/watch?v=E-ObZs32fEU)|[blog](https://twitter.com/nachifur/status/1762730191707881537)|[中文论文(ao9l)](https://rec.ustc.edu.cn/share/60cb4770-1b6a-11ef-8e9e-332aeb6c199a)|[中文视频](https://byuih.xetlk.com/sl/1MurTT)|[中文博客](https://www.zhihu.com/question/645935461/answer/3410873004)
+
 This repository is the official implementation of Residual Denoising Diffusion Models.
 
 <p align="center">
