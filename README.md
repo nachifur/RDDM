@@ -76,11 +76,13 @@ We can convert a pre-trained DDIM to RDDM by coefficient transformation (see [co
 ## Citation
 If you find our work useful in your research, please consider citing:
 ```
-@article{liu2023residual,
-    title={Residual Denoising Diffusion Models}, 
-    author={Jiawei Liu and Qiang Wang and Huijie Fan and Yinong Wang and Yandong Tang and Liangqiong Qu},
-    year={2023},
-    journal={arXiv preprint arxiv:2308.13712}
+@InProceedings{Liu_2024_CVPR,
+    author    = {Liu, Jiawei and Wang, Qiang and Fan, Huijie and Wang, Yinong and Tang, Yandong and Qu, Liangqiong},
+    title     = {Residual Denoising Diffusion Models},
+    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    month     = {June},
+    year      = {2024},
+    pages     = {2773-2783}
 }
 ```
 ## Contact
