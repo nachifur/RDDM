@@ -64,7 +64,7 @@ else:
 
 num_unet = 2
 objective = 'pred_res_noise'
-test_res_or_noise = "noise"
+test_res_or_noise = "res_noise"
 if original_ddim_ddpm:
     model = Unet(
         dim=64,
