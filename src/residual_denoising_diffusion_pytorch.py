@@ -1036,12 +1036,6 @@ class ResidualDiffusion(nn.Module):
                     (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
                     (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
                     sigma2.sqrt()*noise
-            elif type == "special_eta_0":
-                img = img - alpha*pred_res - \
-                    (betas_cumsum-betas_cumsum_next)*pred_noise
-            elif type == "special_eta_1":
-                img = img - alpha*pred_res - betas2/betas_cumsum*pred_noise + \
-                    betas*betas2_cumsum_next.sqrt()/betas_cumsum*noise
             if not last:
                 img_list.append(img)
 
@@ -1091,12 +1085,6 @@ class ResidualDiffusion(nn.Module):
                     (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
                     (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
                     sigma2.sqrt()*noise
-            elif type == "special_eta_0":
-                img = img - alpha*pred_res - \
-                    (betas_cumsum-betas_cumsum_next)*pred_noise
-            elif type == "special_eta_1":
-                img = img - alpha*pred_res - betas2/betas_cumsum*pred_noise + \
-                    betas*betas2_cumsum_next.sqrt()/betas_cumsum*noise
 
             if not last:
                 img_list.append(img)
@@ -1194,12 +1182,6 @@ class ResidualDiffusion(nn.Module):
     #                 (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
     #                 (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
     #                 sigma2.sqrt()*noise
-    #         elif type == "special_eta_0":
-    #             img = img - alpha*pred_res - \
-    #                 (betas_cumsum-betas_cumsum_next)*pred_noise
-    #         elif type == "special_eta_1":
-    #             img = img - alpha*pred_res - betas2/betas_cumsum*pred_noise + \
-    #                 betas*betas2_cumsum_next.sqrt()/betas_cumsum*noise
 
     #         if not last:
     #             img_list.append(img)
