@@ -62,14 +62,27 @@ For image restoration, MATLAB evaluation codes in `./eval`.
 
 ## Pre-trained Models
 
-The pre-trained models will be provided later.
+[Two unets (deresidual+denoising) for partially path-independent generation process](https://rec.ustc.edu.cn/share/3d8d9200-4e7e-11ef-b0ee-250e7e41f368)
 
 
 ## Results
 
 See Table 3 in main paper.
 
-## Other experiments
+**For image generation:**
+
+[Raindrop](https://rec.ustc.edu.cn/share/c20ea640-4e7e-11ef-b29e-b1b12149494a)
+
+[GoPro](https://rec.ustc.edu.cn/share/f9deffc0-4e7e-11ef-b4dd-b51790f24839)
+
+[ISTD](https://rec.ustc.edu.cn/share/da867b10-4e7e-11ef-b21d-b3131e611f52)
+
+[LOL](https://rec.ustc.edu.cn/share/e9c00ab0-4e7e-11ef-89a0-292c4c37c153)
+
+[SID-RGB](https://rec.ustc.edu.cn/share/b213c330-4e7e-11ef-9b3e-957f50ca7d9b)
+
+
+**For image generation (on the CelebA dataset):**
 
 We can convert a pre-trained DDIM to RDDM by coefficient transformation (see [code](https://github.com/nachifur/RDDM/tree/main/experiments/convert_pretrained_DDIM_to_RDDM)).
 
