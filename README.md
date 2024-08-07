@@ -69,7 +69,7 @@ For image restoration, MATLAB evaluation codes in `./eval`.
 
 See Table 3 in main paper.
 
-**For image generation:**
+**For image restoration:**
 
 [Raindrop](https://rec.ustc.edu.cn/share/c20ea640-4e7e-11ef-b29e-b1b12149494a)
 
