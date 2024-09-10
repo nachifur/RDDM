@@ -4,7 +4,7 @@ RDDM  has satisfactory visual results of image inpainting by using only $I_T$ (n
 
 <p align="center">
 <a href="https://cvpr.thecvf.com/virtual/2024/poster/31373" target="_blank">
-<img width="800" height="400" img align="center" alt="RDDM" src="https://github.com/nachifur/RDDM/blob/main/img/fig19.jpg" />
+<img img align="center" alt="RDDM" src="https://github.com/nachifur/RDDM/blob/main/img/fig19.jpg" />
 </a>
 </p>
 
