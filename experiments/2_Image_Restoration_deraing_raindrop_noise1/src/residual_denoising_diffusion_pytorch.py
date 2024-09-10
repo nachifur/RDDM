@@ -3,7 +3,6 @@ import glob
 import math
 import os
 import random
-import sys
 from collections import namedtuple
 from functools import partial
 from multiprocessing import cpu_count
@@ -22,7 +21,7 @@ from einops.layers.torch import Rearrange
 from ema_pytorch import EMA
 from PIL import Image
 from torch import einsum, nn
-from torch.optim import Adam, RAdam
+from torch.optim import Adam
 from torch.utils.data import DataLoader
 from torchvision import transforms as T
 from torchvision import utils
@@ -449,25 +448,107 @@ class UnetRes(nn.Module):
         learned_sinusoidal_cond=False,
         random_fourier_features=False,
         learned_sinusoidal_dim=16,
-        num_unet=1,
+        share_encoder=1,
         condition=False,
-        input_condition=False,
-        objective='pred_res_noise',
-        test_res_or_noise="res_noise"
+        input_condition=False
     ):
         super().__init__()
         self.condition = condition
         self.input_condition = input_condition
+        self.share_encoder = share_encoder
         self.channels = channels
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, default_out_dim)
         self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
         self.self_condition = self_condition
-        self.num_unet = num_unet
-        self.objective = objective
-        self.test_res_or_noise = test_res_or_noise
+
         # determine dimensions
-        if self.num_unet == 2:
+        if self.share_encoder == 1:
+            input_channels = channels + channels * \
+                (1 if self_condition else 0) + \
+                channels * (1 if condition else 0) + channels * \
+                (1 if input_condition else 0)
+            init_dim = default(init_dim, dim)
+            self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding=3)
+
+            dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
+            in_out = list(zip(dims[:-1], dims[1:]))
+
+            block_klass = partial(ResnetBlock, groups=resnet_block_groups)
+
+            # time embeddings
+
+            time_dim = dim * 4
+
+            if self.random_or_learned_sinusoidal_cond:
+                sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(
+                    learned_sinusoidal_dim, random_fourier_features)
+                fourier_dim = learned_sinusoidal_dim + 1
+            else:
+                sinu_pos_emb = SinusoidalPosEmb(dim)
+                fourier_dim = dim
+
+            self.time_mlp = nn.Sequential(
+                sinu_pos_emb,
+                nn.Linear(fourier_dim, time_dim),
+                nn.GELU(),
+                nn.Linear(time_dim, time_dim)
+            )
+
+            # layers
+
+            self.downs = nn.ModuleList([])
+            self.ups = nn.ModuleList([])
+            self.ups_no_skip = nn.ModuleList([])
+            num_resolutions = len(in_out)
+
+            for ind, (dim_in, dim_out) in enumerate(in_out):
+                is_last = ind >= (num_resolutions - 1)
+
+                self.downs.append(nn.ModuleList([
+                    block_klass(dim_in, dim_in, time_emb_dim=time_dim),
+                    block_klass(dim_in, dim_in, time_emb_dim=time_dim),
+                    Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                    Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(
+                        dim_in, dim_out, 3, padding=1)
+                ]))
+
+            mid_dim = dims[-1]
+            self.mid_block1 = block_klass(
+                mid_dim, mid_dim, time_emb_dim=time_dim)
+            self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
+            self.mid_block2 = block_klass(
+                mid_dim, mid_dim, time_emb_dim=time_dim)
+
+            for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
+                is_last = ind == (len(in_out) - 1)
+
+                self.ups.append(nn.ModuleList([
+                    block_klass(dim_out + dim_in, dim_out,
+                                time_emb_dim=time_dim),
+                    block_klass(dim_out + dim_in, dim_out,
+                                time_emb_dim=time_dim),
+                    Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                    Upsample(dim_out, dim_in) if not is_last else nn.Conv2d(
+                        dim_out, dim_in, 3, padding=1)
+                ]))
+
+                self.ups_no_skip.append(nn.ModuleList([
+                    block_klass(dim_out, dim_out, time_emb_dim=time_dim),
+                    block_klass(dim_out, dim_out, time_emb_dim=time_dim),
+                    Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                    Upsample(dim_out, dim_in) if not is_last else nn.Conv2d(
+                        dim_out, dim_in, 3, padding=1)
+                ]))
+
+            self.final_res_block_1 = block_klass(
+                dim, dim, time_emb_dim=time_dim)
+            self.final_conv_1 = nn.Conv2d(dim, self.out_dim, 1)
+
+            self.final_res_block_2 = block_klass(
+                dim * 2, dim, time_emb_dim=time_dim)
+            self.final_conv_2 = nn.Conv2d(dim, self.out_dim, 1)
+        elif self.share_encoder == 0:
             self.unet0 = Unet(dim,
                               init_dim=init_dim,
                               out_dim=out_dim,
@@ -494,7 +575,7 @@ class UnetRes(nn.Module):
                               learned_sinusoidal_dim=learned_sinusoidal_dim,
                               condition=condition,
                               input_condition=input_condition)
-        elif self.num_unet == 1:
+        elif self.share_encoder == -1:
             self.unet0 = Unet(dim,
                               init_dim=init_dim,
                               out_dim=out_dim,
@@ -509,28 +590,62 @@ class UnetRes(nn.Module):
                               condition=condition,
                               input_condition=input_condition)
 
-
     def forward(self, x, time, x_self_cond=None):
-        if self.num_unet == 2:
-            if self.test_res_or_noise == "res_noise":
-                return self.unet0(x, time[0], x_self_cond=x_self_cond), self.unet1(x, time[1], x_self_cond=x_self_cond)
-            elif self.test_res_or_noise == "res":
-                return self.unet0(x, time[0], x_self_cond=x_self_cond), 0
-            elif self.test_res_or_noise == "noise":
-                return 0, self.unet1(x, time[1], x_self_cond=x_self_cond)
-        elif self.num_unet == 1:
-            if self.objective == 'pred_res_noise':
-                # num_unet=2
-                pass
-            elif self.objective == 'pred_x0_noise':
-                # num_unet=2
-                pass
-            elif self.objective == "pred_noise":
-                time = time[1]
-            elif self.objective == "pred_res":
-                time = time[0]
-            elif self.objective == "auto_res_noise":
-                time = time[0]
+        if self.share_encoder == 1:
+            if self.self_condition:
+                x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
+                x = torch.cat((x_self_cond, x), dim=1)
+
+            x = self.init_conv(x)
+            r = x.clone()
+
+            t = self.time_mlp(time)
+
+            h = []
+
+            for block1, block2, attn, downsample in self.downs:
+                x = block1(x, t)
+                h.append(x)
+
+                x = block2(x, t)
+                x = attn(x)
+                h.append(x)
+
+                x = downsample(x)
+
+            x = self.mid_block1(x, t)
+            x = self.mid_attn(x)
+            x = self.mid_block2(x, t)
+
+            out_res = x
+            for block1, block2, attn, upsample in self.ups_no_skip:
+                out_res = block1(out_res, t)
+                out_res = block2(out_res, t)
+                out_res = attn(out_res)
+
+                out_res = upsample(out_res)
+
+            out_res = self.final_res_block_1(out_res, t)
+            out_res = self.final_conv_1(out_res)
+
+            for block1, block2, attn, upsample in self.ups:
+                x = torch.cat((x, h.pop()), dim=1)
+                x = block1(x, t)
+
+                x = torch.cat((x, h.pop()), dim=1)
+                x = block2(x, t)
+                x = attn(x)
+
+                x = upsample(x)
+
+            x = torch.cat((x, r), dim=1)
+            x = self.final_res_block_2(x, t)
+            out_res_add_noise = self.final_conv_2(x)
+
+            return out_res, out_res_add_noise
+        elif self.share_encoder == 0:
+            return self.unet0(x, time, x_self_cond=x_self_cond), self.unet1(x, time, x_self_cond=x_self_cond)
+        elif self.share_encoder == -1:
             return [self.unet0(x, time, x_self_cond=x_self_cond)]
 
 # gaussian diffusion trainer class
@@ -542,65 +657,23 @@ def extract(a, t, x_shape):
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 
-def gen_coefficients(timesteps, schedule="increased", sum_scale=1, ratio=1):
+def gen_coefficients(timesteps, schedule="increased", sum_scale=1):
     if schedule == "increased":
-        x = np.linspace(0, 1, timesteps, dtype=np.float32)
-        y = x**ratio
-        y = torch.from_numpy(y)
-        y_sum = y.sum()
-        alphas = y/y_sum
+        x = torch.linspace(1, timesteps, timesteps, dtype=torch.float64)
+        scale = 0.5*timesteps*(timesteps+1)
+        alphas = x/scale
     elif schedule == "decreased":
-        x = np.linspace(0, 1, timesteps, dtype=np.float32)
-        y = x**ratio
-        y = torch.from_numpy(y)
-        y_sum = y.sum()
-        y = torch.flip(y, dims=[0])
-        alphas = y/y_sum
+        x = torch.linspace(1, timesteps, timesteps, dtype=torch.float64)
+        x = torch.flip(x, dims=[0])
+        scale = 0.5*timesteps*(timesteps+1)
+        alphas = x/scale
     elif schedule == "average":
-        alphas = torch.full([timesteps], 1/timesteps, dtype=torch.float32)
-    elif schedule == "normal":
-        sigma = 1.0
-        mu = 0.0
-        x = np.linspace(-3+mu, 3+mu, timesteps, dtype=np.float32)
-        y = np.e**(-((x-mu)**2)/(2*(sigma**2)))/(np.sqrt(2*np.pi)*(sigma**2))
-        y = torch.from_numpy(y)
-        alphas = y/y.sum()
+        alphas = torch.full([timesteps], 1/timesteps, dtype=torch.float64)
     else:
-        alphas = torch.full([timesteps], 1/timesteps, dtype=torch.float32)
-    assert (alphas.sum()-1).abs() < 1e-6
+        alphas = torch.full([timesteps], 1/timesteps, dtype=torch.float64)
+    assert alphas.sum()-torch.tensor(1) < torch.tensor(1e-10)
 
     return alphas*sum_scale
-
-# Copied from diffusers.schedulers.scheduling_ddpm.betas_for_alpha_bar
-
-
-def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999) -> torch.Tensor:
-    """
-    Create a beta schedule that discretizes the given alpha_t_bar function, which defines the cumulative product of
-    (1-beta) over time from t = [0,1].
-
-    Contains a function alpha_bar that takes an argument t and transforms it to the cumulative product of (1-beta) up
-    to that part of the diffusion process.
-
-
-    Args:
-        num_diffusion_timesteps (`int`): the number of betas to produce.
-        max_beta (`float`): the maximum beta to use; use values lower than 1 to
-                     prevent singularities.
-
-    Returns:
-        betas (`np.ndarray`): the betas used by the scheduler to step the model outputs
-    """
-
-    def alpha_bar(time_step):
-        return math.cos((time_step + 0.008) / 1.008 * math.pi / 2) ** 2
-
-    betas = []
-    for i in range(num_diffusion_timesteps):
-        t1 = i / num_diffusion_timesteps
-        t2 = (i + 1) / num_diffusion_timesteps
-        betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
-    return torch.tensor(betas, dtype=torch.float32)
 
 
 class ResidualDiffusion(nn.Module):
@@ -617,9 +690,7 @@ class ResidualDiffusion(nn.Module):
         condition=False,
         sum_scale=None,
         input_condition=False,
-        input_condition_mask=False,
-        test_res_or_noise=None,
-        alpha_res_to_0_or_1=None
+        input_condition_mask=False
     ):
         super().__init__()
         assert not (
@@ -634,7 +705,6 @@ class ResidualDiffusion(nn.Module):
         self.condition = condition
         self.input_condition = input_condition
         self.input_condition_mask = input_condition_mask
-        self.test_res_or_noise = test_res_or_noise
 
         if self.condition:
             self.sum_scale = sum_scale if sum_scale else 0.01
@@ -642,50 +712,14 @@ class ResidualDiffusion(nn.Module):
         else:
             self.sum_scale = sum_scale if sum_scale else 1.
 
-        convert_to_ddim=True
-        if convert_to_ddim:
-            beta_schedule = "linear"
-            beta_start = 0.0001
-            beta_end = 0.02
-            if beta_schedule == "linear":
-                betas = torch.linspace(
-                    beta_start, beta_end, timesteps, dtype=torch.float32)
-            elif beta_schedule == "scaled_linear":
-                # this schedule is very specific to the latent diffusion model.
-                betas = (
-                    torch.linspace(beta_start**0.5, beta_end**0.5,
-                                   timesteps, dtype=torch.float32) ** 2
-                )
-            elif beta_schedule == "squaredcos_cap_v2":
-                # Glide cosine schedule
-                betas = betas_for_alpha_bar(timesteps)
-            else:
-                raise NotImplementedError(
-                    f"{beta_schedule} does is not implemented for {self.__class__}")
-
-            alphas = 1.0 - betas
-            alphas_cumprod = torch.cumprod(alphas, dim=0)
-            alphas_cumsum = 1-alphas_cumprod ** 0.5
-            betas2_cumsum = 1-alphas_cumprod
-
-            alphas_cumsum_prev = F.pad(alphas_cumsum[:-1], (1, 0), value=1.)
-            betas2_cumsum_prev = F.pad(betas2_cumsum[:-1], (1, 0), value=1.)
-            alphas = alphas_cumsum-alphas_cumsum_prev
-            alphas[0] = 0
-            betas2 = betas2_cumsum-betas2_cumsum_prev
-            betas2[0] = 0
-        else:
-            alphas = gen_coefficients(timesteps, schedule="decreased")
-            betas2 = gen_coefficients(
-                timesteps, schedule="increased", sum_scale=self.sum_scale)
-
-            alphas_cumsum = alphas.cumsum(dim=0).clip(0, 1)
-            betas2_cumsum = betas2.cumsum(dim=0).clip(0, 1)
-
-            alphas_cumsum_prev = F.pad(alphas_cumsum[:-1], (1, 0), value=1.)
-            betas2_cumsum_prev = F.pad(betas2_cumsum[:-1], (1, 0), value=1.)
-
+        alphas = gen_coefficients(timesteps, schedule="decreased")
+        alphas_cumsum = alphas.cumsum(dim=0).clip(0, 1)
+        alphas_cumsum_prev = F.pad(alphas_cumsum[:-1], (1, 0), value=1.)
+        betas2 = gen_coefficients(
+            timesteps, schedule="increased", sum_scale=self.sum_scale)
+        betas2_cumsum = betas2.cumsum(dim=0).clip(0, 1)
         betas_cumsum = torch.sqrt(betas2_cumsum)
+        betas2_cumsum_prev = F.pad(betas2_cumsum[:-1], (1, 0), value=1.)
         posterior_variance = betas2*betas2_cumsum_prev/betas2_cumsum
         posterior_variance[0] = 0
 
@@ -719,101 +753,6 @@ class ResidualDiffusion(nn.Module):
         register_buffer('posterior_variance', posterior_variance)
         register_buffer('posterior_log_variance_clipped',
                         torch.log(posterior_variance.clamp(min=1e-20)))
-
-        self.posterior_mean_coef1[0] = 0
-        self.posterior_mean_coef2[0] = 0
-        self.posterior_mean_coef3[0] = 1
-        self.one_minus_alphas_cumsum[-1] = 1e-6
-
-        if objective == "auto_res_noise":
-            if alpha_res_to_0_or_1:
-                self.alpha_res_to_0_or_1 = alpha_res_to_0_or_1
-                self.alpha_res = torch.nn.Parameter(alpha_res_to_0_or_1*torch.ones((1)), requires_grad=True)
-            else:
-                self.alpha_res = torch.nn.Parameter(0.5*torch.ones((1)), requires_grad=True)
-                self.alpha_res_to_0_or_1 = None
-
-    def init(self):
-        timesteps = 1000
-
-        convert_to_ddim = True
-        if convert_to_ddim:
-            beta_schedule = "linear"
-            beta_start = 0.0001
-            beta_end = 0.02
-            if beta_schedule == "linear":
-                betas = torch.linspace(
-                    beta_start, beta_end, timesteps, dtype=torch.float32)
-            elif beta_schedule == "scaled_linear":
-                # this schedule is very specific to the latent diffusion model.
-                betas = (
-                    torch.linspace(beta_start**0.5, beta_end**0.5,
-                                   timesteps, dtype=torch.float32) ** 2
-                )
-            elif beta_schedule == "squaredcos_cap_v2":
-                # Glide cosine schedule
-                betas = betas_for_alpha_bar(timesteps)
-            else:
-                raise NotImplementedError(
-                    f"{beta_schedule} does is not implemented for {self.__class__}")
-
-            alphas = 1.0 - betas
-            alphas_cumprod = torch.cumprod(alphas, dim=0)
-            alphas_cumsum = 1-alphas_cumprod ** 0.5
-            betas2_cumsum = 1-alphas_cumprod
-
-            alphas_cumsum_prev = F.pad(alphas_cumsum[:-1], (1, 0), value=1.)
-            betas2_cumsum_prev = F.pad(betas2_cumsum[:-1], (1, 0), value=1.)
-            alphas = alphas_cumsum-alphas_cumsum_prev
-            alphas[0] = alphas[1]
-            betas2 = betas2_cumsum-betas2_cumsum_prev
-            betas2[0] = betas2[1]
-
-            # adjust
-            # alphas = gen_coefficients(timesteps, schedule="average", ratio=0)
-            # alphas_cumsum = alphas.cumsum(dim=0).clip(0, 1)
-            # alphas_cumsum_prev = F.pad(
-            #     alphas_cumsum[:-1], (1, 0), value=alphas_cumsum[1])
-
-            # betas2 = gen_coefficients(
-            #     timesteps, schedule="average", sum_scale=self.sum_scale, ratio=0)
-            # betas2_cumsum = betas2.cumsum(dim=0).clip(0, 1)
-            # betas2_cumsum_prev = F.pad(
-            #     betas2_cumsum[:-1], (1, 0), value=betas2_cumsum[1])
-        else:
-            alphas = gen_coefficients(timesteps, schedule="average", ratio=1)
-            betas2 = gen_coefficients(
-                timesteps, schedule="increased", sum_scale=self.sum_scale, ratio=3)
-
-            alphas_cumsum = alphas.cumsum(dim=0).clip(0, 1)
-            betas2_cumsum = betas2.cumsum(dim=0).clip(0, 1)
-
-            alphas_cumsum_prev = F.pad(
-                alphas_cumsum[:-1], (1, 0), value=alphas_cumsum[1])
-            betas2_cumsum_prev = F.pad(
-                betas2_cumsum[:-1], (1, 0), value=betas2_cumsum[1])
-
-        betas_cumsum = torch.sqrt(betas2_cumsum)
-        posterior_variance = betas2*betas2_cumsum_prev/betas2_cumsum
-        posterior_variance[0] = 0
-
-        timesteps, = alphas.shape
-        self.num_timesteps = int(timesteps)
-
-        self.alphas = alphas
-        self.alphas_cumsum = alphas_cumsum
-        self.one_minus_alphas_cumsum = 1-alphas_cumsum
-        self.betas2 = betas2
-        self.betas = torch.sqrt(betas2)
-        self.betas2_cumsum = betas2_cumsum
-        self.betas_cumsum = betas_cumsum
-        self.posterior_mean_coef1 = betas2_cumsum_prev/betas2_cumsum
-        self.posterior_mean_coef2 = (
-            betas2 * alphas_cumsum_prev-betas2_cumsum_prev*alphas)/betas2_cumsum
-        self.posterior_mean_coef3 = betas2/betas2_cumsum
-        self.posterior_variance = posterior_variance
-        self.posterior_log_variance_clipped = torch.log(
-            posterior_variance.clamp(min=1e-20))
 
         self.posterior_mean_coef1[0] = 0
         self.posterior_mean_coef2[0] = 0
@@ -862,36 +801,34 @@ class ResidualDiffusion(nn.Module):
             else:
                 x_in = torch.cat((x, x_input), dim=1)
         model_output = self.model(x_in,
-                                  [t,t],
+                                  t,
                                   x_self_cond)
         maybe_clip = partial(torch.clamp, min=-1.,
                              max=1.) if clip_denoised else identity
 
         if self.objective == 'pred_res_noise':
-            if self.test_res_or_noise == "res_noise":
-                pred_res = model_output[0]
-                pred_noise = model_output[1]
-                pred_res = maybe_clip(pred_res)
-                x_start = self.predict_start_from_res_noise(
-                    x, t, pred_res, pred_noise)
-                x_start = maybe_clip(x_start)
-            elif self.test_res_or_noise == "res":
-                pred_res = model_output[0]
-                pred_res = maybe_clip(pred_res)
-                pred_noise = self.predict_noise_from_res(
-                    x, t, x_input, pred_res)
-                x_start = x_input - pred_res
-                x_start = maybe_clip(x_start)
-            elif self.test_res_or_noise == "noise":
-                pred_noise = model_output[1]
-                x_start = self.predict_start_from_xinput_noise(
-                    x, t, x_input, pred_noise)
-                x_start = maybe_clip(x_start)
-                pred_res = x_input - x_start
-                pred_res = maybe_clip(pred_res)
+            pred_res = model_output[0]
+            pred_noise = model_output[1]
+            pred_res = maybe_clip(pred_res)
+            x_start = self.predict_start_from_res_noise(
+                x, t, pred_res, pred_noise)
+            x_start = maybe_clip(x_start)
+        elif self.objective == 'pred_res_add_noise':
+            pred_res = model_output[0]
+            pred_noise = model_output[1] - model_output[0]
+            pred_res = maybe_clip(pred_res)
+            x_start = self.predict_start_from_res_noise(
+                x, t, pred_res, pred_noise)
+            x_start = maybe_clip(x_start)
         elif self.objective == 'pred_x0_noise':
             pred_res = x_input-model_output[0]
             pred_noise = model_output[1]
+            pred_res = maybe_clip(pred_res)
+            x_start = maybe_clip(model_output[0])
+        elif self.objective == 'pred_x0_add_noise':
+            x_start = model_output[0]
+            pred_noise = model_output[1] - model_output[0]
+            pred_res = x_input-x_start
             pred_res = maybe_clip(pred_res)
             x_start = maybe_clip(model_output[0])
         elif self.objective == "pred_noise":
@@ -907,21 +844,6 @@ class ResidualDiffusion(nn.Module):
             pred_noise = self.predict_noise_from_res(x, t, x_input, pred_res)
             x_start = x_input - pred_res
             x_start = maybe_clip(x_start)
-        elif self.objective == "auto_res_noise":
-            print(self.alpha_res)
-            if self.alpha_res > 0.5:
-                pred_res = model_output[0]
-                pred_res = maybe_clip(pred_res)
-                pred_noise = self.predict_noise_from_res(x, t, x_input, pred_res)
-                x_start = x_input - pred_res
-                x_start = maybe_clip(x_start)
-            else:
-                pred_noise = model_output[0]
-                x_start = self.predict_start_from_xinput_noise(
-                    x, t, x_input, pred_noise)
-                x_start = maybe_clip(x_start)
-                pred_res = x_input - x_start
-                pred_res = maybe_clip(pred_res)
 
         return ModelResPrediction(pred_res, pred_noise, x_start)
 
@@ -989,159 +911,6 @@ class ResidualDiffusion(nn.Module):
                 img_list = [img]
             return unnormalize_to_zero_to_one(img_list)
 
-    # @torch.no_grad()
-    # def ddim_sample(self, x_input, shape, last=True):
-    #     if self.input_condition:
-    #         x_input_condition = x_input[1]
-    #     else:
-    #         x_input_condition = 0
-    #     x_input = x_input[0]
-
-    #     batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[
-    #         0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
-
-    #     # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-    #     times = torch.linspace(-1, total_timesteps - 1,
-    #                            steps=sampling_timesteps + 1)
-    #     times = list(reversed(times.int().tolist()))
-    #     # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
-    #     time_pairs = list(zip(times[:-1], times[1:]))
-
-    #     if self.condition:
-    #         img = x_input+math.sqrt(self.sum_scale) * \
-    #             torch.randn(shape, device=device)
-    #         input_add_noise = img
-    #     else:
-    #         img = torch.randn(shape, device=device)
-
-    #     x_start = None
-    #     type = "use_pred_noise"
-
-    #     if not last:
-    #         img_list = []
-
-    #     for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
-    #         time_cond = torch.full(
-    #             (batch,), time, device=device, dtype=torch.long)
-    #         self_cond = x_start if self.self_condition else None
-    #         preds = self.model_predictions(
-    #             x_input, img, time_cond, x_input_condition, self_cond)
-
-    #         pred_res = preds.pred_res
-    #         pred_noise = preds.pred_noise
-    #         x_start = preds.pred_x_start
-
-    #         if time_next < 0:
-    #             img = x_start
-    #             if not last:
-    #                 img_list.append(img)
-    #             continue
-
-    #         alpha_cumsum = self.alphas_cumsum[time]
-    #         alpha_cumsum_next = self.alphas_cumsum[time_next]
-    #         alpha = alpha_cumsum-alpha_cumsum_next
-
-    #         betas2_cumsum = self.betas2_cumsum[time]
-    #         betas2_cumsum_next = self.betas2_cumsum[time_next]
-    #         betas2 = betas2_cumsum-betas2_cumsum_next
-    #         betas = betas2.sqrt()
-    #         betas_cumsum = self.betas_cumsum[time]
-    #         betas_cumsum_next = self.betas_cumsum[time_next]
-    #         sigma2 = eta * (betas2*betas2_cumsum_next/betas2_cumsum)
-    #         sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum = (
-    #             betas2_cumsum_next-sigma2).sqrt()/betas_cumsum
-
-    #         if eta == 0:
-    #             noise = 0
-    #         else:
-    #             noise = torch.randn_like(img)
-
-    #         if type == "use_pred_noise":
-    #             img = img - alpha*pred_res + sigma2.sqrt()*noise
-    #         elif type == "use_x_start":
-    #             img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum*img + \
-    #                 (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
-    #                 (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
-    #                 sigma2.sqrt()*noise
-    #         elif type == "special_eta_0":
-    #             img = img - alpha*pred_res - \
-    #                 (betas_cumsum-betas_cumsum_next)*pred_noise
-    #         elif type == "special_eta_1":
-    #             img = img - alpha*pred_res - betas2/betas_cumsum*pred_noise + \
-    #                 betas*betas2_cumsum_next.sqrt()/betas_cumsum*noise
-    #         if not last:
-    #             img_list.append(img)
-
-
-
-    #     for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
-    #         time_cond = torch.full(
-    #             (batch,), time, device=device, dtype=torch.long)
-    #         self_cond = x_start if self.self_condition else None
-    #         preds = self.model_predictions(
-    #             x_input, img, time_cond, x_input_condition, self_cond)
-
-    #         pred_res = preds.pred_res
-    #         pred_noise = preds.pred_noise
-    #         x_start = preds.pred_x_start
-
-    #         if time_next < 0:
-    #             img = x_start
-    #             if not last:
-    #                 img_list.append(img)
-    #             continue
-
-    #         alpha_cumsum = self.alphas_cumsum[time]
-    #         alpha_cumsum_next = self.alphas_cumsum[time_next]
-    #         alpha = alpha_cumsum-alpha_cumsum_next
-
-    #         betas2_cumsum = self.betas2_cumsum[time]
-    #         betas2_cumsum_next = self.betas2_cumsum[time_next]
-    #         betas2 = betas2_cumsum-betas2_cumsum_next
-    #         betas = betas2.sqrt()
-    #         betas_cumsum = self.betas_cumsum[time]
-    #         betas_cumsum_next = self.betas_cumsum[time_next]
-    #         sigma2 = eta * (betas2*betas2_cumsum_next/betas2_cumsum)
-    #         sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum = (
-    #             betas2_cumsum_next-sigma2).sqrt()/betas_cumsum
-
-    #         if eta == 0:
-    #             noise = 0
-    #         else:
-    #             noise = torch.randn_like(img)
-
-    #         if type == "use_pred_noise":
-    #             img = img - (betas_cumsum-(betas2_cumsum_next-sigma2).sqrt()) * \
-    #                 pred_noise + sigma2.sqrt()*noise
-    #         elif type == "use_x_start":
-    #             img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum*img + \
-    #                 (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
-    #                 (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
-    #                 sigma2.sqrt()*noise
-    #         elif type == "special_eta_0":
-    #             img = img - alpha*pred_res - \
-    #                 (betas_cumsum-betas_cumsum_next)*pred_noise
-    #         elif type == "special_eta_1":
-    #             img = img - alpha*pred_res - betas2/betas_cumsum*pred_noise + \
-    #                 betas*betas2_cumsum_next.sqrt()/betas_cumsum*noise
-
-    #         if not last:
-    #             img_list.append(img)
-
-
-    #     if self.condition:
-    #         if not last:
-    #             img_list = [input_add_noise]+img_list
-    #         else:
-    #             img_list = [input_add_noise, img]
-    #         return unnormalize_to_zero_to_one(img_list)
-    #     else:
-    #         if not last:
-    #             img_list = img_list
-    #         else:
-    #             img_list = [img]
-    #         return unnormalize_to_zero_to_one(img_list)
-
     @torch.no_grad()
     def ddim_sample(self, x_input, shape, last=True):
         if self.input_condition:
@@ -1173,8 +942,6 @@ class ResidualDiffusion(nn.Module):
         if not last:
             img_list = []
 
-        eta = 0
-
         for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
             time_cond = torch.full(
                 (batch,), time, device=device, dtype=torch.long)
@@ -1199,7 +966,6 @@ class ResidualDiffusion(nn.Module):
             betas2_cumsum = self.betas2_cumsum[time]
             betas2_cumsum_next = self.betas2_cumsum[time_next]
             betas2 = betas2_cumsum-betas2_cumsum_next
-            # betas2 = 1-(1-betas2_cumsum)/(1-betas2_cumsum_next)
             betas = betas2.sqrt()
             betas_cumsum = self.betas_cumsum[time]
             betas_cumsum_next = self.betas_cumsum[time_next]
@@ -1316,7 +1082,7 @@ class ResidualDiffusion(nn.Module):
                 x_in = torch.cat((x, x_input), dim=1)
 
         model_out = self.model(x_in,
-                               [t,t],
+                               t,
                                x_self_cond)
 
         target = []
@@ -1326,12 +1092,24 @@ class ResidualDiffusion(nn.Module):
 
             pred_res = model_out[0]
             pred_noise = model_out[1]
+        elif self.objective == 'pred_res_add_noise':
+            target.append(x_res)
+            target.append(x_res+noise)
+
+            pred_res = model_out[0]
+            pred_noise = model_out[1]-model_out[0]
         elif self.objective == 'pred_x0_noise':
             target.append(x_start)
             target.append(noise)
 
             pred_res = x_input-model_out[0]
             pred_noise = model_out[1]
+        elif self.objective == 'pred_x0_add_noise':
+            target.append(x_start)
+            target.append(x_start+noise)
+
+            pred_res = x_input-model_out[0]
+            pred_noise = model_out[1] - model_out[0]
         elif self.objective == "pred_noise":
             target.append(noise)
 
@@ -1341,85 +1119,22 @@ class ResidualDiffusion(nn.Module):
             target.append(x_res)
 
             pred_res = model_out[0]
-            
-        elif self.objective == "auto_res_noise":
-            loss_list = []
-            clip_denoised = True
-            maybe_clip = partial(torch.clamp, min=-1.,
-                                max=1.) if clip_denoised else identity
-            
-            if self.alpha_res_to_0_or_1 == None:
-                alpha_res_value = self.alpha_res.item()
-            else:
-                alpha_res_value = self.alpha_res_to_0_or_1
-            print(alpha_res_value)
-            sys.stdout.flush()
-            if np.abs(alpha_res_value - 0.5)<1e-2:
-                target.append(x_res)
-                target.append(noise)
 
-                # if is res
-                x_start = self.predict_start_from_xinput_noise(x, t, x_input, model_out[0])
-                x_start = maybe_clip(x_start)
-                pred_res = x_input - x_start # from noise
-
-                pred_res = self.alpha_res*model_out[0] + (1-self.alpha_res)*pred_res
-
-                # if is noise
-                pred_noise = self.predict_noise_from_res(x, t, x_input, model_out[0]) # from res
-                pred_noise = self.alpha_res*pred_noise+(1-self.alpha_res)*model_out[0]
-
-                loss = self.loss_fn(pred_res, target[0], reduction='none')
-                loss = reduce(loss, 'b ... -> b (...)', 'mean').mean()
-                loss_list.append(loss)
-
-                loss = self.loss_fn(pred_noise, target[1], reduction='none')
-                loss = reduce(loss, 'b ... -> b (...)', 'mean').mean()
-                loss_list.append(loss)
-                print("res+noise")
-            elif alpha_res_value>0.5:
-                target.append(x_res)
-
-                pred_res = model_out[0]
-
-                loss = self.loss_fn(model_out[0], target[0], reduction='none')
-                loss = reduce(loss, 'b ... -> b (...)', 'mean').mean()
-                loss_list.append(loss)
-
-                loss_list.append(0)
-                print("res")
-                self.alpha_res_to_0_or_1 = 1
-            elif alpha_res_value<0.5:
-                target.append(noise)
-
-                pred_noise = model_out[0]
-
-                loss_list.append(0)
-
-                loss = self.loss_fn(model_out[0], target[0], reduction='none')
-                loss = reduce(loss, 'b ... -> b (...)', 'mean').mean()
-                loss_list.append(loss)
-                print("noise")
-                self.alpha_res_to_0_or_1 = 0
-            sys.stdout.flush()
-
-            return loss_list
         else:
             raise ValueError(f'unknown objective {self.objective}')
-        
+
         u_loss = False
         if u_loss:
             x_u = self.q_posterior_from_res_noise(pred_res, pred_noise, x, t)
             u_gt = self.q_posterior_from_res_noise(x_res, noise, x, t)
             loss = 10000*self.loss_fn(x_u, u_gt, reduction='none')
-            return [loss]
         else:
-            loss_list = []
+            loss = 0
             for i in range(len(model_out)):
-                loss = self.loss_fn(model_out[i], target[i], reduction='none')
-                loss = reduce(loss, 'b ... -> b (...)', 'mean').mean()
-                loss_list.append(loss)
-            return loss_list
+                loss = loss + \
+                    self.loss_fn(model_out[i], target[i], reduction='none')
+        loss = reduce(loss, 'b ... -> b (...)', 'mean')
+        return loss.mean()
 
     def forward(self, img, *args, **kwargs):
         if isinstance(img, list):
@@ -1439,6 +1154,8 @@ class ResidualDiffusion(nn.Module):
         return self.p_losses(img, t, *args, **kwargs)
 
 # trainer class
+
+
 class Trainer(object):
     def __init__(
         self,
@@ -1464,8 +1181,7 @@ class Trainer(object):
         sub_dir=False,
         equalizeHist=False,
         crop_patch=False,
-        generation=False,
-        num_unet=2
+        generation=False
     ):
         super().__init__()
 
@@ -1491,7 +1207,6 @@ class Trainer(object):
         self.train_num_steps = train_num_steps
         self.image_size = diffusion_model.image_size
         self.condition = condition
-        self.num_unet = num_unet
 
         if self.condition:
             if len(folder) == 3:
@@ -1550,18 +1265,8 @@ class Trainer(object):
 
         # optimizer
 
-        # self.opt = Adam(diffusion_model.parameters(),
-        #                 lr=train_lr, betas=adam_betas)
-        if self.num_unet == 1:
-            # self.opt0 = RAdam(diffusion_model.parameters(),
-            #                   lr=train_lr, weight_decay=0.0)
-            self.opt0 = Adam(diffusion_model.parameters(),
-                            lr=train_lr, betas=adam_betas)
-        elif self.num_unet == 2:
-            self.opt0 = RAdam(
-                diffusion_model.model.unet0.parameters(), lr=train_lr, weight_decay=0.0)
-            self.opt1 = RAdam(
-                diffusion_model.model.unet1.parameters(), lr=train_lr, weight_decay=0.0)
+        self.opt = Adam(diffusion_model.parameters(),
+                        lr=train_lr, betas=adam_betas)
 
         # for logging results in a folder periodically
 
@@ -1576,35 +1281,23 @@ class Trainer(object):
         self.step = 0
 
         # prepare model, dataloader, optimizer with accelerator
-        if self.num_unet == 1:
-            self.model, self.opt0 = self.accelerator.prepare(
-                self.model, self.opt0)
-        elif self.num_unet == 2:
-            self.model, self.opt0, self.opt1 = self.accelerator.prepare(
-                self.model, self.opt0, self.opt1)
+
+        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
         device = self.accelerator.device
         self.device = device
 
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
             return
-        if self.num_unet == 1:
-            data = {
-                'step': self.step,
-                'model': self.accelerator.get_state_dict(self.model),
-                'opt0': self.opt0.state_dict(),
-                'ema': self.ema.state_dict(),
-                'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
-            }
-        elif self.num_unet == 2:
-            data = {
-                'step': self.step,
-                'model': self.accelerator.get_state_dict(self.model),
-                'opt0': self.opt0.state_dict(),
-                'opt1': self.opt1.state_dict(),
-                'ema': self.ema.state_dict(),
-                'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
-            }
+
+        data = {
+            'step': self.step,
+            'model': self.accelerator.get_state_dict(self.model),
+            'opt': self.opt.state_dict(),
+            'ema': self.ema.state_dict(),
+            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
+        }
+
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone):
@@ -1618,11 +1311,7 @@ class Trainer(object):
             model.load_state_dict(data['model'])
 
             self.step = data['step']
-            if self.num_unet == 1:
-                self.opt0.load_state_dict(data['opt0'])
-            elif self.num_unet == 2:
-                self.opt0.load_state_dict(data['opt0'])
-                self.opt1.load_state_dict(data['opt1'])
+            self.opt.load_state_dict(data['opt'])
             self.ema.load_state_dict(data['ema'])
 
             if exists(self.accelerator.scaler) and exists(data['scaler']):
@@ -1630,19 +1319,17 @@ class Trainer(object):
 
             print("load model - "+str(path))
 
-        # self.ema.to(self.device)
+        self.ema.to(self.device)
 
-    def train(self, ATDP=False):
+    def train(self):
         accelerator = self.accelerator
 
         with tqdm(initial=self.step, total=self.train_num_steps, disable=not accelerator.is_main_process) as pbar:
 
             while self.step < self.train_num_steps:
 
-                if self.num_unet == 1:
-                    total_loss = [0]
-                elif self.num_unet == 2:
-                    total_loss = [0, 0]
+                total_loss = 0.
+
                 for _ in range(self.gradient_accumulate_every):
                     if self.condition:
                         data = next(self.dl)
@@ -1654,38 +1341,17 @@ class Trainer(object):
 
                     with self.accelerator.autocast():
                         loss = self.model(data)
-                        if self.model.objective == "auto_res_noise":
-                            if self.model.alpha_res_to_0_or_1 == None:
-                                alpha_res_value=self.model.alpha_res
-                            else:
-                                alpha_res_value=self.model.alpha_res_to_0_or_1
-                            loss[0] = alpha_res_value*loss[0] / self.gradient_accumulate_every
-                            loss[1] = (1-alpha_res_value)*loss[1] / self.gradient_accumulate_every
-                            loss[0] = loss[0] + loss[1]
-                            total_loss[0] = loss[0].item()
-                        else:
-                            for i in range(self.num_unet):
-                                loss[i] = loss[i] / self.gradient_accumulate_every
-                                total_loss[i] = total_loss[i] + loss[i].item()
+                        loss = loss / self.gradient_accumulate_every
+                        total_loss = total_loss + loss.item()
 
-                    for i in range(self.num_unet):
-                        self.accelerator.backward(loss[i])
-
-                if ATDP and (self.model.alpha_res_to_0_or_1==0 or self.model.alpha_res_to_0_or_1==1):
-                    return self.model.alpha_res_to_0_or_1
+                    self.accelerator.backward(loss)
 
                 accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
 
                 accelerator.wait_for_everyone()
 
-                if self.num_unet == 1:
-                    self.opt0.step()
-                    self.opt0.zero_grad()
-                elif self.num_unet == 2:
-                    self.opt0.step()
-                    self.opt0.zero_grad()
-                    self.opt1.step()
-                    self.opt1.zero_grad()
+                self.opt.step()
+                self.opt.zero_grad()
 
                 accelerator.wait_for_everyone()
 
@@ -1700,19 +1366,8 @@ class Trainer(object):
 
                         if self.step != 0 and self.step % (self.save_and_sample_every*10) == 0:
                             self.save(milestone)
-                            results_folder = self.results_folder
-                            gen_img = './results/test_timestep_10_' + \
-                                str(milestone)+"_pt"
-                            self.set_results_folder(gen_img)
-                            self.test(last=True, FID=True)
-                            os.system(
-                                "python fid_and_inception_score.py "+gen_img)
-                            self.set_results_folder(results_folder)
-                if self.num_unet == 1:
-                    pbar.set_description(f'loss_unet0: {total_loss[0]:.4f}')
-                elif self.num_unet == 2:
-                    pbar.set_description(
-                        f'loss_unet0: {total_loss[0]:.4f},loss_unet1: {total_loss[1]:.4f}')
+
+                pbar.set_description(f'loss: {total_loss:.4f}')
                 pbar.update(1)
 
         accelerator.print('training complete')
@@ -1758,7 +1413,7 @@ class Trainer(object):
                     utils.save_image(
                         all_images_list[0][i].unsqueeze(0), os.path.join(self.results_folder, file_name), nrow=1)
                     milestone += 1
-                    if milestone >= self.total_n_samples:
+                    if milestone>=self.total_n_samples:
                         break
             else:
                 file_name = f'sample-{milestone}.png'
@@ -1768,8 +1423,6 @@ class Trainer(object):
         return milestone
 
     def test(self, sample=False, last=True, FID=False):
-        self.ema.ema_model.init()
-        self.ema.to(self.device)
         print("test start")
         if self.condition:
             self.ema.ema_model.eval()
@@ -1837,8 +1490,7 @@ class Trainer(object):
             if FID:
                 self.total_n_samples = 50000
                 img_id = len(glob.glob(f"{self.results_folder}/*"))
-                n_rounds = (self.total_n_samples -
-                            img_id) // self.num_samples+1
+                n_rounds = (self.total_n_samples - img_id) // self.num_samples+1
             else:
                 n_rounds = 100
             for i in range(n_rounds):

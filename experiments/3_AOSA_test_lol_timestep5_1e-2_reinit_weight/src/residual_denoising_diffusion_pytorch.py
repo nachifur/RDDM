@@ -3,6 +3,7 @@ import glob
 import math
 import os
 import random
+import sys
 from collections import namedtuple
 from functools import partial
 from multiprocessing import cpu_count
@@ -508,6 +509,7 @@ class UnetRes(nn.Module):
                               condition=condition,
                               input_condition=input_condition)
 
+
     def forward(self, x, time, x_self_cond=None):
         if self.num_unet == 2:
             if self.test_res_or_noise == "res_noise":
@@ -526,6 +528,8 @@ class UnetRes(nn.Module):
             elif self.objective == "pred_noise":
                 time = time[1]
             elif self.objective == "pred_res":
+                time = time[0]
+            elif self.objective == "auto_res_noise":
                 time = time[0]
             return [self.unet0(x, time, x_self_cond=x_self_cond)]
 
@@ -614,7 +618,8 @@ class ResidualDiffusion(nn.Module):
         sum_scale=None,
         input_condition=False,
         input_condition_mask=False,
-        test_res_or_noise="None"
+        test_res_or_noise=None,
+        alpha_res_to_0_or_1=None
     ):
         super().__init__()
         assert not (
@@ -719,6 +724,14 @@ class ResidualDiffusion(nn.Module):
         self.posterior_mean_coef2[0] = 0
         self.posterior_mean_coef3[0] = 1
         self.one_minus_alphas_cumsum[-1] = 1e-6
+
+        if objective == "auto_res_noise":
+            if alpha_res_to_0_or_1:
+                self.alpha_res_to_0_or_1 = alpha_res_to_0_or_1
+                self.alpha_res = torch.nn.Parameter(alpha_res_to_0_or_1*torch.ones((1)), requires_grad=True)
+            else:
+                self.alpha_res = torch.nn.Parameter(0.5*torch.ones((1)), requires_grad=True)
+                self.alpha_res_to_0_or_1 = None
 
     def init(self):
         timesteps = 1000
@@ -849,8 +862,7 @@ class ResidualDiffusion(nn.Module):
             else:
                 x_in = torch.cat((x, x_input), dim=1)
         model_output = self.model(x_in,
-                                  [self.alphas_cumsum[t]*self.num_timesteps,
-                                      self.betas_cumsum[t]*self.num_timesteps],
+                                  [t,t],
                                   x_self_cond)
         maybe_clip = partial(torch.clamp, min=-1.,
                              max=1.) if clip_denoised else identity
@@ -895,6 +907,21 @@ class ResidualDiffusion(nn.Module):
             pred_noise = self.predict_noise_from_res(x, t, x_input, pred_res)
             x_start = x_input - pred_res
             x_start = maybe_clip(x_start)
+        elif self.objective == "auto_res_noise":
+            print(self.alpha_res)
+            if self.alpha_res > 0.5:
+                pred_res = model_output[0]
+                pred_res = maybe_clip(pred_res)
+                pred_noise = self.predict_noise_from_res(x, t, x_input, pred_res)
+                x_start = x_input - pred_res
+                x_start = maybe_clip(x_start)
+            else:
+                pred_noise = model_output[0]
+                x_start = self.predict_start_from_xinput_noise(
+                    x, t, x_input, pred_noise)
+                x_start = maybe_clip(x_start)
+                pred_res = x_input - x_start
+                pred_res = maybe_clip(pred_res)
 
         return ModelResPrediction(pred_res, pred_noise, x_start)
 
@@ -962,147 +989,6 @@ class ResidualDiffusion(nn.Module):
                 img_list = [img]
             return unnormalize_to_zero_to_one(img_list)
 
-    @torch.no_grad()
-    def ddim_sample(self, x_input, shape, last=True):
-        if self.input_condition:
-            x_input_condition = x_input[1]
-        else:
-            x_input_condition = 0
-        x_input = x_input[0]
-
-        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[
-            0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
-
-        # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-        times = torch.linspace(-1, total_timesteps - 1,
-                               steps=sampling_timesteps + 1)
-        times = list(reversed(times.int().tolist()))
-        # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
-        time_pairs = list(zip(times[:-1], times[1:]))
-
-        if self.condition:
-            img = x_input+math.sqrt(self.sum_scale) * \
-                torch.randn(shape, device=device)
-            input_add_noise = img
-        else:
-            img = torch.randn(shape, device=device)
-
-        x_start = None
-        type = "use_pred_noise"
-
-        if not last:
-            img_list = []
-
-        for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
-            time_cond = torch.full(
-                (batch,), time, device=device, dtype=torch.long)
-            self_cond = x_start if self.self_condition else None
-            preds = self.model_predictions(
-                x_input, img, time_cond, x_input_condition, self_cond)
-
-            pred_res = preds.pred_res
-            pred_noise = preds.pred_noise
-            x_start = preds.pred_x_start
-
-            if time_next < 0:
-                img = x_start
-                if not last:
-                    img_list.append(img)
-                continue
-
-            alpha_cumsum = self.alphas_cumsum[time]
-            alpha_cumsum_next = self.alphas_cumsum[time_next]
-            alpha = alpha_cumsum-alpha_cumsum_next
-
-            betas2_cumsum = self.betas2_cumsum[time]
-            betas2_cumsum_next = self.betas2_cumsum[time_next]
-            betas2 = betas2_cumsum-betas2_cumsum_next
-            betas = betas2.sqrt()
-            betas_cumsum = self.betas_cumsum[time]
-            betas_cumsum_next = self.betas_cumsum[time_next]
-            sigma2 = eta * (betas2*betas2_cumsum_next/betas2_cumsum)
-            sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum = (
-                betas2_cumsum_next-sigma2).sqrt()/betas_cumsum
-
-            if eta == 0:
-                noise = 0
-            else:
-                noise = torch.randn_like(img)
-
-            if type == "use_pred_noise":
-                img = img - alpha*pred_res + sigma2.sqrt()*noise
-            elif type == "use_x_start":
-                img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum*img + \
-                    (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
-                    (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
-                    sigma2.sqrt()*noise
-            if not last:
-                img_list.append(img)
-
-
-
-        for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
-            time_cond = torch.full(
-                (batch,), time, device=device, dtype=torch.long)
-            self_cond = x_start if self.self_condition else None
-            preds = self.model_predictions(
-                x_input, img, time_cond, x_input_condition, self_cond)
-
-            pred_res = preds.pred_res
-            pred_noise = preds.pred_noise
-            x_start = preds.pred_x_start
-
-            if time_next < 0:
-                img = x_start
-                if not last:
-                    img_list.append(img)
-                continue
-
-            alpha_cumsum = self.alphas_cumsum[time]
-            alpha_cumsum_next = self.alphas_cumsum[time_next]
-            alpha = alpha_cumsum-alpha_cumsum_next
-
-            betas2_cumsum = self.betas2_cumsum[time]
-            betas2_cumsum_next = self.betas2_cumsum[time_next]
-            betas2 = betas2_cumsum-betas2_cumsum_next
-            betas = betas2.sqrt()
-            betas_cumsum = self.betas_cumsum[time]
-            betas_cumsum_next = self.betas_cumsum[time_next]
-            sigma2 = eta * (betas2*betas2_cumsum_next/betas2_cumsum)
-            sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum = (
-                betas2_cumsum_next-sigma2).sqrt()/betas_cumsum
-
-            if eta == 0:
-                noise = 0
-            else:
-                noise = torch.randn_like(img)
-
-            if type == "use_pred_noise":
-                img = img - (betas_cumsum-(betas2_cumsum_next-sigma2).sqrt()) * \
-                    pred_noise + sigma2.sqrt()*noise
-            elif type == "use_x_start":
-                img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum*img + \
-                    (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
-                    (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
-                    sigma2.sqrt()*noise
-
-            if not last:
-                img_list.append(img)
-
-
-        if self.condition:
-            if not last:
-                img_list = [input_add_noise]+img_list
-            else:
-                img_list = [input_add_noise, img]
-            return unnormalize_to_zero_to_one(img_list)
-        else:
-            if not last:
-                img_list = img_list
-            else:
-                img_list = [img]
-            return unnormalize_to_zero_to_one(img_list)
-
     # @torch.no_grad()
     # def ddim_sample(self, x_input, shape, last=True):
     #     if self.input_condition:
@@ -1134,7 +1020,59 @@ class ResidualDiffusion(nn.Module):
     #     if not last:
     #         img_list = []
 
-    #     eta = 0
+    #     for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
+    #         time_cond = torch.full(
+    #             (batch,), time, device=device, dtype=torch.long)
+    #         self_cond = x_start if self.self_condition else None
+    #         preds = self.model_predictions(
+    #             x_input, img, time_cond, x_input_condition, self_cond)
+
+    #         pred_res = preds.pred_res
+    #         pred_noise = preds.pred_noise
+    #         x_start = preds.pred_x_start
+
+    #         if time_next < 0:
+    #             img = x_start
+    #             if not last:
+    #                 img_list.append(img)
+    #             continue
+
+    #         alpha_cumsum = self.alphas_cumsum[time]
+    #         alpha_cumsum_next = self.alphas_cumsum[time_next]
+    #         alpha = alpha_cumsum-alpha_cumsum_next
+
+    #         betas2_cumsum = self.betas2_cumsum[time]
+    #         betas2_cumsum_next = self.betas2_cumsum[time_next]
+    #         betas2 = betas2_cumsum-betas2_cumsum_next
+    #         betas = betas2.sqrt()
+    #         betas_cumsum = self.betas_cumsum[time]
+    #         betas_cumsum_next = self.betas_cumsum[time_next]
+    #         sigma2 = eta * (betas2*betas2_cumsum_next/betas2_cumsum)
+    #         sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum = (
+    #             betas2_cumsum_next-sigma2).sqrt()/betas_cumsum
+
+    #         if eta == 0:
+    #             noise = 0
+    #         else:
+    #             noise = torch.randn_like(img)
+
+    #         if type == "use_pred_noise":
+    #             img = img - alpha*pred_res + sigma2.sqrt()*noise
+    #         elif type == "use_x_start":
+    #             img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum*img + \
+    #                 (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
+    #                 (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
+    #                 sigma2.sqrt()*noise
+    #         elif type == "special_eta_0":
+    #             img = img - alpha*pred_res - \
+    #                 (betas_cumsum-betas_cumsum_next)*pred_noise
+    #         elif type == "special_eta_1":
+    #             img = img - alpha*pred_res - betas2/betas_cumsum*pred_noise + \
+    #                 betas*betas2_cumsum_next.sqrt()/betas_cumsum*noise
+    #         if not last:
+    #             img_list.append(img)
+
+
 
     #     for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
     #         time_cond = torch.full(
@@ -1160,7 +1098,6 @@ class ResidualDiffusion(nn.Module):
     #         betas2_cumsum = self.betas2_cumsum[time]
     #         betas2_cumsum_next = self.betas2_cumsum[time_next]
     #         betas2 = betas2_cumsum-betas2_cumsum_next
-    #         # betas2 = 1-(1-betas2_cumsum)/(1-betas2_cumsum_next)
     #         betas = betas2.sqrt()
     #         betas_cumsum = self.betas_cumsum[time]
     #         betas_cumsum_next = self.betas_cumsum[time_next]
@@ -1174,17 +1111,23 @@ class ResidualDiffusion(nn.Module):
     #             noise = torch.randn_like(img)
 
     #         if type == "use_pred_noise":
-    #             img = img - alpha*pred_res - \
-    #                 (betas_cumsum-(betas2_cumsum_next-sigma2).sqrt()) * \
+    #             img = img - (betas_cumsum-(betas2_cumsum_next-sigma2).sqrt()) * \
     #                 pred_noise + sigma2.sqrt()*noise
     #         elif type == "use_x_start":
     #             img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum*img + \
     #                 (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
     #                 (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
     #                 sigma2.sqrt()*noise
+    #         elif type == "special_eta_0":
+    #             img = img - alpha*pred_res - \
+    #                 (betas_cumsum-betas_cumsum_next)*pred_noise
+    #         elif type == "special_eta_1":
+    #             img = img - alpha*pred_res - betas2/betas_cumsum*pred_noise + \
+    #                 betas*betas2_cumsum_next.sqrt()/betas_cumsum*noise
 
     #         if not last:
     #             img_list.append(img)
+
 
     #     if self.condition:
     #         if not last:
@@ -1198,6 +1141,108 @@ class ResidualDiffusion(nn.Module):
     #         else:
     #             img_list = [img]
     #         return unnormalize_to_zero_to_one(img_list)
+
+    @torch.no_grad()
+    def ddim_sample(self, x_input, shape, last=True):
+        if self.input_condition:
+            x_input_condition = x_input[1]
+        else:
+            x_input_condition = 0
+        x_input = x_input[0]
+
+        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[
+            0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+
+        # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        times = torch.linspace(-1, total_timesteps - 1,
+                               steps=sampling_timesteps + 1)
+        times = list(reversed(times.int().tolist()))
+        # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+        time_pairs = list(zip(times[:-1], times[1:]))
+
+        if self.condition:
+            img = x_input+math.sqrt(self.sum_scale) * \
+                torch.randn(shape, device=device)
+            input_add_noise = img
+        else:
+            img = torch.randn(shape, device=device)
+
+        x_start = None
+        type = "use_pred_noise"
+
+        if not last:
+            img_list = []
+
+        eta = 0
+
+        for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
+            time_cond = torch.full(
+                (batch,), time, device=device, dtype=torch.long)
+            self_cond = x_start if self.self_condition else None
+            preds = self.model_predictions(
+                x_input, img, time_cond, x_input_condition, self_cond)
+
+            pred_res = preds.pred_res
+            pred_noise = preds.pred_noise
+            x_start = preds.pred_x_start
+
+            if time_next < 0:
+                img = x_start
+                if not last:
+                    img_list.append(img)
+                continue
+
+            alpha_cumsum = self.alphas_cumsum[time]
+            alpha_cumsum_next = self.alphas_cumsum[time_next]
+            alpha = alpha_cumsum-alpha_cumsum_next
+
+            betas2_cumsum = self.betas2_cumsum[time]
+            betas2_cumsum_next = self.betas2_cumsum[time_next]
+            betas2 = betas2_cumsum-betas2_cumsum_next
+            # betas2 = 1-(1-betas2_cumsum)/(1-betas2_cumsum_next)
+            betas = betas2.sqrt()
+            betas_cumsum = self.betas_cumsum[time]
+            betas_cumsum_next = self.betas_cumsum[time_next]
+            sigma2 = eta * (betas2*betas2_cumsum_next/betas2_cumsum)
+            sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum = (
+                betas2_cumsum_next-sigma2).sqrt()/betas_cumsum
+
+            if eta == 0:
+                noise = 0
+            else:
+                noise = torch.randn_like(img)
+
+            if type == "use_pred_noise":
+                img = img - alpha*pred_res - \
+                    (betas_cumsum-(betas2_cumsum_next-sigma2).sqrt()) * \
+                    pred_noise + sigma2.sqrt()*noise
+            elif type == "use_x_start":
+                img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum*img + \
+                    (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
+                    (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
+                    sigma2.sqrt()*noise
+            elif type == "special_eta_0":
+                img = img - alpha*pred_res - \
+                    (betas_cumsum-betas_cumsum_next)*pred_noise
+            elif type == "special_eta_1":
+                img = img - alpha*pred_res - betas2/betas_cumsum*pred_noise + \
+                    betas*betas2_cumsum_next.sqrt()/betas_cumsum*noise
+
+            if not last:
+                img_list.append(img)
+
+        if self.condition:
+            if not last:
+                img_list = [input_add_noise]+img_list
+            else:
+                img_list = [input_add_noise, img]
+            return unnormalize_to_zero_to_one(img_list)
+        else:
+            if not last:
+                img_list = img_list
+            else:
+                img_list = [img]
+            return unnormalize_to_zero_to_one(img_list)
 
     @torch.no_grad()
     def sample(self, x_input=0, batch_size=16, last=True):
@@ -1271,8 +1316,7 @@ class ResidualDiffusion(nn.Module):
                 x_in = torch.cat((x, x_input), dim=1)
 
         model_out = self.model(x_in,
-                               [self.alphas_cumsum[t]*self.num_timesteps,
-                                   self.betas_cumsum[t]*self.num_timesteps],
+                               [t,t],
                                x_self_cond)
 
         target = []
@@ -1297,10 +1341,72 @@ class ResidualDiffusion(nn.Module):
             target.append(x_res)
 
             pred_res = model_out[0]
+            
+        elif self.objective == "auto_res_noise":
+            loss_list = []
+            clip_denoised = True
+            maybe_clip = partial(torch.clamp, min=-1.,
+                                max=1.) if clip_denoised else identity
+            
+            if self.alpha_res_to_0_or_1 == None:
+                alpha_res_value = self.alpha_res.item()
+            else:
+                alpha_res_value = self.alpha_res_to_0_or_1
+            print(alpha_res_value)
+            sys.stdout.flush()
+            if np.abs(alpha_res_value - 0.5)<1e-2:
+                target.append(x_res)
+                target.append(noise)
 
+                # if is res
+                x_start = self.predict_start_from_xinput_noise(x, t, x_input, model_out[0])
+                x_start = maybe_clip(x_start)
+                pred_res = x_input - x_start # from noise
+
+                pred_res = self.alpha_res*model_out[0] + (1-self.alpha_res)*pred_res
+
+                # if is noise
+                pred_noise = self.predict_noise_from_res(x, t, x_input, model_out[0]) # from res
+                pred_noise = self.alpha_res*pred_noise+(1-self.alpha_res)*model_out[0]
+
+                loss = self.loss_fn(pred_res, target[0], reduction='none')
+                loss = reduce(loss, 'b ... -> b (...)', 'mean').mean()
+                loss_list.append(loss)
+
+                loss = self.loss_fn(pred_noise, target[1], reduction='none')
+                loss = reduce(loss, 'b ... -> b (...)', 'mean').mean()
+                loss_list.append(loss)
+                print("res+noise")
+            elif alpha_res_value>0.5:
+                target.append(x_res)
+
+                pred_res = model_out[0]
+
+                loss = self.loss_fn(model_out[0], target[0], reduction='none')
+                loss = reduce(loss, 'b ... -> b (...)', 'mean').mean()
+                loss_list.append(loss)
+
+                loss_list.append(0)
+                print("res")
+                self.alpha_res_to_0_or_1 = 1
+            elif alpha_res_value<0.5:
+                target.append(noise)
+
+                pred_noise = model_out[0]
+
+                loss_list.append(0)
+
+                loss = self.loss_fn(model_out[0], target[0], reduction='none')
+                loss = reduce(loss, 'b ... -> b (...)', 'mean').mean()
+                loss_list.append(loss)
+                print("noise")
+                self.alpha_res_to_0_or_1 = 0
+            sys.stdout.flush()
+
+            return loss_list
         else:
             raise ValueError(f'unknown objective {self.objective}')
-
+        
         u_loss = False
         if u_loss:
             x_u = self.q_posterior_from_res_noise(pred_res, pred_noise, x, t)
@@ -1333,8 +1439,6 @@ class ResidualDiffusion(nn.Module):
         return self.p_losses(img, t, *args, **kwargs)
 
 # trainer class
-
-
 class Trainer(object):
     def __init__(
         self,
@@ -1449,8 +1553,10 @@ class Trainer(object):
         # self.opt = Adam(diffusion_model.parameters(),
         #                 lr=train_lr, betas=adam_betas)
         if self.num_unet == 1:
-            self.opt0 = RAdam(diffusion_model.parameters(),
-                              lr=train_lr, weight_decay=0.0)
+            # self.opt0 = RAdam(diffusion_model.parameters(),
+            #                   lr=train_lr, weight_decay=0.0)
+            self.opt0 = Adam(diffusion_model.parameters(),
+                            lr=train_lr, betas=adam_betas)
         elif self.num_unet == 2:
             self.opt0 = RAdam(
                 diffusion_model.model.unet0.parameters(), lr=train_lr, weight_decay=0.0)
@@ -1526,7 +1632,7 @@ class Trainer(object):
 
         # self.ema.to(self.device)
 
-    def train(self):
+    def train(self, ATDP=False):
         accelerator = self.accelerator
 
         with tqdm(initial=self.step, total=self.train_num_steps, disable=not accelerator.is_main_process) as pbar:
@@ -1548,12 +1654,25 @@ class Trainer(object):
 
                     with self.accelerator.autocast():
                         loss = self.model(data)
-                        for i in range(self.num_unet):
-                            loss[i] = loss[i] / self.gradient_accumulate_every
-                            total_loss[i] = total_loss[i] + loss[i].item()
+                        if self.model.objective == "auto_res_noise":
+                            if self.model.alpha_res_to_0_or_1 == None:
+                                alpha_res_value=self.model.alpha_res
+                            else:
+                                alpha_res_value=self.model.alpha_res_to_0_or_1
+                            loss[0] = alpha_res_value*loss[0] / self.gradient_accumulate_every
+                            loss[1] = (1-alpha_res_value)*loss[1] / self.gradient_accumulate_every
+                            loss[0] = loss[0] + loss[1]
+                            total_loss[0] = loss[0].item()
+                        else:
+                            for i in range(self.num_unet):
+                                loss[i] = loss[i] / self.gradient_accumulate_every
+                                total_loss[i] = total_loss[i] + loss[i].item()
 
                     for i in range(self.num_unet):
                         self.accelerator.backward(loss[i])
+
+                if ATDP and (self.model.alpha_res_to_0_or_1==0 or self.model.alpha_res_to_0_or_1==1):
+                    return self.model.alpha_res_to_0_or_1
 
                 accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
 
