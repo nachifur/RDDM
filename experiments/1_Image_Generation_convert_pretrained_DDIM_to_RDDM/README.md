@@ -1,5 +1,5 @@
-# Image Generation (convert a pre-trained DDIM to RDDM by coefficient transformation)
 
+# Image Generation (convert a pre-trained DDIM to RDDM by coefficient transformation)
 We use a pre-trained DDIM by `from diffusers import DDIMPipeline` (the version of `diffusers` is 0.15.1).  See [huggingface.co/google/ddpm-celebahq-256](https://huggingface.co/google/ddpm-celebahq-256) for more details.
 
 1. find `scheduling_ddim.py`, e.g., `/home/liu/anaconda3/envs/diffusion/lib/python3.7/site-packages/diffusers/schedulers/scheduling_ddim.py`.
