@@ -80,7 +80,7 @@ See Table 3 in main paper.
 
 **For image generation (on the CelebA dataset):**
 
-We can convert a pre-trained DDIM to RDDM by coefficient transformation (see [1_Image_Generation_convert_pretrained_DDIM_to_RDDM](https://github.com/nachifur/RDDM/tree/main/experiments/1_Image_Generation_convert_pretrained_DDIM_to_RDDM).
+We can convert a pre-trained DDIM to RDDM by coefficient transformation (see [1_Image_Generation_convert_pretrained_DDIM_to_RDDM](https://github.com/nachifur/RDDM/tree/main/experiments/1_Image_Generation_convert_pretrained_DDIM_to_RDDM)).
 
 ## Citation
 If you find our work useful in your research, please consider citing:
