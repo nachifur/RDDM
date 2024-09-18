@@ -17,6 +17,11 @@ To install requirements:
 ```
 conda env create -f install.yaml
 ```
+maybe run:
+```
+conda config --append channels nvidia
+conda config --append channels pytorch
+```
 
 ## Dataset
 
