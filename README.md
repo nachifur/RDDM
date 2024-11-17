@@ -12,7 +12,7 @@ This repository is the official implementation of Residual Denoising Diffusion M
 
 ## Requirements
 
-To install requirements:
+To install requirements: (If an error occurs, you may need to install the packages one by one.)
 
 ```
 conda env create -f install.yaml
