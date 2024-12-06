@@ -5,10 +5,12 @@ The current setting is to train two unets (one to estimate the residuals and one
 **1. Load Pre-trained Models**
 
 Download [the pre-trained models (two unets, deresidual+denoising)](https://rec.ustc.edu.cn/share/3d8d9200-4e7e-11ef-b0ee-250e7e41f368) for [partially path-independent generation process](https://github.com/nachifur/RDDM/tree/main/experiments/0_Partially_path-independent_generation).
-
 ```
 cd ./RDDM/experiments/0_Partially_path-independent_generation
 cp model-100.pt ./results/sample/
+```
+[Then, you should set the path of celeba dataset.](https://github.com/nachifur/RDDM/blob/d5a6b82de5166b92f22570e258f9e590e23231ff/experiments/0_Partially_path-independent_generation/train.py#L59)
+```
 python test.py
 ```
 
