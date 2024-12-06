@@ -59,8 +59,7 @@ For image restoration, MATLAB evaluation codes in `./eval`.
 
 ## Pre-trained Models
 
-[Two unets (deresidual+denoising) for partially path-independent generation process](https://rec.ustc.edu.cn/share/3d8d9200-4e7e-11ef-b0ee-250e7e41f368)
-
+[The pre-trained models (two unets, deresidual+denoising)](https://rec.ustc.edu.cn/share/3d8d9200-4e7e-11ef-b0ee-250e7e41f368) for [partially path-independent generation process](https://github.com/nachifur/RDDM/tree/main/experiments/0_Partially_path-independent_generation)
 
 ## Results
 
