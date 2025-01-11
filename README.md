@@ -95,4 +95,4 @@ If you find our work useful in your research, please consider citing:
 }
 ```
 ## Contact
-Please contact Liangqiong Qu (https://liangqiong.github.io/) or Jiawei Liu (liujiawei18@mails.ucas.ac.cn) if there is any question.
+Please contact Jiawei Liu (liujiawei18@mails.ucas.ac.cn) or Liangqiong Qu (https://liangqiong.github.io/) if there is any question.
