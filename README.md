@@ -86,6 +86,7 @@ We can convert a pre-trained DDIM to RDDM by coefficient transformation (see [1_
 https://github.com/nachifur/RDDM/tree/main/experiments
 
 [0_**Partially_path-independent**_generation](https://github.com/nachifur/RDDM/tree/main/experiments/0_Partially_path-independent_generation)
+
 [1_Image_Generation_convert_pretrained_**DDIM_to_RDDM**](1_Image_Generation_convert_pretrained_DDIM_to_RDDM)
 
 [2_**Image_Restoration**_deraing_raindrop_noise1](https://github.com/nachifur/RDDM/tree/main/experiments/2_Image_Restoration_deraing_raindrop_noise1)
