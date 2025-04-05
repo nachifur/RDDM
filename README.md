@@ -82,6 +82,22 @@ See Table 3 in main paper.
 
 We can convert a pre-trained DDIM to RDDM by coefficient transformation (see [1_Image_Generation_convert_pretrained_DDIM_to_RDDM](https://github.com/nachifur/RDDM/tree/main/experiments/1_Image_Generation_convert_pretrained_DDIM_to_RDDM)).
 
+## Experiments 
+https://github.com/nachifur/RDDM/tree/main/experiments
+
+[0_**Partially_path-independent**_generation](https://github.com/nachifur/RDDM/tree/main/experiments/0_Partially_path-independent_generation)
+[1_Image_Generation_convert_pretrained_**DDIM_to_RDDM**](1_Image_Generation_convert_pretrained_DDIM_to_RDDM)
+
+[2_**Image_Restoration**_deraing_raindrop_noise1](https://github.com/nachifur/RDDM/tree/main/experiments/2_Image_Restoration_deraing_raindrop_noise1)
+
+[3_**Automatic-Objective-Selection-Algorithm**_test_lol_timestep5_1e-2_reinit_weight](https://github.com/nachifur/RDDM/tree/main/experiments/3_AOSA_test_lol_timestep5_1e-2_reinit_weight)
+
+[4_**Image_Inpainting**_imgsize64_batch64_pred_res_noise_centermask_wo_mask_wo_input](https://github.com/nachifur/RDDM/tree/main/experiments/4_Image_Inpainting_imgsize64_batch64_pred_res_noise_centermask_wo_mask_wo_input)
+
+[5_**Image_translation**_dog_to_cat_wo_input_imgsize64_batch64_pred_res_noise](https://github.com/nachifur/RDDM/tree/main/experiments/5_Image_translation_dog_to_cat_wo_input_imgsize64_batch64_pred_res_noise)
+
+[6_**Image_Generation**_table2_decreased_alpha_increased_beta](https://github.com/nachifur/RDDM/tree/main/experiments/6_Image_Generation_table2_decreased_alpha_increased_beta)
+
 ## Citation
 If you find our work useful in your research, please consider citing:
 ```
